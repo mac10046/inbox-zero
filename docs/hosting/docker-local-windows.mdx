@@ -1,0 +1,306 @@
+---
+title: 'Local Docker Setup (Windows + Ollama)'
+description: 'Run Inbox Zero locally on Windows with Docker Compose, the prebuilt image, and a local Ollama LLM — a step-by-step guide for a developer setting it up for the first time.'
+---
+
+This is a beginner-friendly, end-to-end walkthrough for getting Inbox Zero
+running on your own Windows machine using **Docker Compose**, the **prebuilt
+image** (`ghcr.io/elie222/inbox-zero:latest`), and a **local Ollama** model for
+the AI — no paid API key required.
+
+It uses the standard [`docker-compose.yml`](https://github.com/elie222/inbox-zero/blob/main/docker-compose.yml)
+at the repo root, which runs five containers: `db` (Postgres), `redis`,
+`serverless-redis-http` (an Upstash-compatible HTTP layer over Redis), `web`
+(the app), and `cron` (a tiny scheduler that pings the app's cron endpoints).
+
+<Warning>
+**Before you start — what email accounts actually work.**
+
+Inbox Zero only connects email via **OAuth** to **Google (Gmail / Google
+Workspace)** or **Microsoft (Outlook / Microsoft 365)**. See
+[Connecting email accounts](#connecting-email-accounts) at the bottom. There is
+**no IMAP/SMTP support**, so **Yahoo** and **generic IMAP/Exchange** mailboxes
+**cannot be connected**. You can still run the whole app — you just can't link
+those mailboxes.
+</Warning>
+
+## Prerequisites
+
+<Steps>
+  <Step title="Docker Desktop (WSL2 backend)">
+    Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) and
+    make sure it is **running** before you continue. Use the **WSL2** backend
+    (Settings → General). Give it at least **4 GB** RAM (Settings → Resources).
+
+    Verify:
+    ```powershell
+    docker version
+    docker compose version
+    ```
+  </Step>
+
+  <Step title="Ollama (local LLM)">
+    Install [Ollama](https://ollama.com/download) for Windows, start the server,
+    and pull a small chat model:
+    ```powershell
+    # Start the Ollama server (skip if the Ollama app is already running)
+    Start-Process ollama -ArgumentList "serve" -WindowStyle Hidden
+
+    # Pull a small, fast model (≈1 GB)
+    ollama pull qwen2.5:1.5b
+
+    # Confirm it's reachable and the model is listed
+    (Invoke-WebRequest http://localhost:11434/api/tags -UseBasicParsing).Content
+    ```
+    <Note>
+    Any chat model works (`llama3`, `qwen2.5`, etc.). Whatever you pull, use that
+    exact name as `OLLAMA_MODEL` below. Small local models are great for kicking
+    the tyres but produce lower-quality results than hosted models — switch to a
+    real provider (Anthropic/OpenAI/OpenRouter) later if you need quality.
+    </Note>
+  </Step>
+
+  <Step title="Clone the repo">
+    ```powershell
+    git clone https://github.com/elie222/inbox-zero.git
+    cd inbox-zero
+    ```
+    Run every command below from the **repo root**.
+  </Step>
+</Steps>
+
+## Step 1 — Create and configure `apps/web/.env`
+
+Copy the example file:
+
+```powershell
+Copy-Item apps/web/.env.example apps/web/.env
+```
+
+### Generate the required secrets
+
+The app **will not boot** without these. On Windows you don't need `openssl` —
+this PowerShell helper prints all the secrets at once:
+
+```powershell
+function New-Hex($n){ -join ((1..$n)|%{'{0:x2}' -f (Get-Random -Max 256)}) }
+"AUTH_SECRET=$(New-Hex 32)"
+"EMAIL_ENCRYPT_SECRET=$(New-Hex 32)"
+"EMAIL_ENCRYPT_SALT=$(New-Hex 16)"
+"INTERNAL_API_KEY=$(New-Hex 32)"
+"API_KEY_SALT=$(New-Hex 32)"
+"CRON_SECRET=$(New-Hex 32)"
+"UPSTASH_REDIS_TOKEN=$(New-Hex 32)"
+```
+
+Paste each generated value into the matching line in `apps/web/.env`.
+
+### The values you must set
+
+| Variable | Value |
+|---|---|
+| `AUTH_SECRET` | generated 64-hex |
+| `EMAIL_ENCRYPT_SECRET` | generated 64-hex |
+| `EMAIL_ENCRYPT_SALT` | generated 32-hex |
+| `INTERNAL_API_KEY` | generated 64-hex |
+| `API_KEY_SALT` | generated 64-hex |
+| `CRON_SECRET` | generated 64-hex (without it the `cron` container is rejected) |
+| `UPSTASH_REDIS_TOKEN` | generated 64-hex (**also goes in the root `.env`**, see Step 2) |
+| `GOOGLE_CLIENT_ID` | `placeholder` (real value needed to log in — see below) |
+| `GOOGLE_CLIENT_SECRET` | `placeholder` |
+| `GOOGLE_PUBSUB_TOPIC_NAME` | leave the example default (must be non-empty) |
+| `DEFAULT_LLM_PROVIDER` | `ollama` |
+| `OLLAMA_MODEL` | `qwen2.5:1.5b` (or whatever you pulled) |
+| `OLLAMA_BASE_URL` | `http://host.docker.internal:11434/api` |
+
+<Warning>
+**Why `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` = `placeholder`?**
+
+The app validates its environment on startup and **requires these to be
+non-empty** — the shipped `.env.example` leaves them blank, which makes the
+container crash-loop. Placeholders let the app **boot** and pass the health
+check. They are **not** enough to actually **log in** — Google is the sign-in
+provider, so you need real OAuth credentials before you can sign into the app
+(see [Connecting email accounts](#connecting-email-accounts)).
+</Warning>
+
+The Ollama block in `apps/web/.env` should end up looking like this:
+
+```ini
+# --- Ollama (Local LLM) ---
+DEFAULT_LLM_PROVIDER=ollama
+OLLAMA_MODEL=qwen2.5:1.5b
+# host.docker.internal lets the web CONTAINER reach Ollama on the Windows HOST
+OLLAMA_BASE_URL=http://host.docker.internal:11434/api
+```
+
+<Note>
+**`host.docker.internal`, not `localhost`.** Ollama runs on your Windows host,
+but the app runs inside a container. From inside the container, `localhost`
+means the container itself — `host.docker.internal` is the Docker Desktop alias
+that routes back to the host.
+</Note>
+
+You can leave `DATABASE_URL`, `DIRECT_URL`, and `UPSTASH_REDIS_URL` at their
+example values — Docker Compose overrides them for the container with the
+correct internal hostnames (`db`, `serverless-redis-http`).
+
+## Step 2 — Create a root `.env` (fixes the Redis token)
+
+This is the one non-obvious gotcha. Docker Compose reads `${VARIABLE}`
+**interpolation** values (used in `docker-compose.yml`) from a `.env` file in
+the **repo root** — it does **not** read `apps/web/.env` for that. The
+`serverless-redis-http` service sets its auth token from
+`SRH_TOKEN: ${UPSTASH_REDIS_TOKEN}`, so if the root `.env` is missing you'll see:
+
+```
+warning: The "UPSTASH_REDIS_TOKEN" variable is not set. Defaulting to a blank string.
+```
+
+…and the Redis HTTP server ends up with a **blank** token while the app sends
+the real one → every Redis call fails with **401**.
+
+Create a root `.env` with the **same** token you put in `apps/web/.env`:
+
+```powershell
+"UPSTASH_REDIS_TOKEN=<paste the same 64-hex value here>" | Out-File -Encoding utf8 .env
+```
+
+<Check>
+The token in the **root `.env`** and in **`apps/web/.env`** must be **identical**.
+</Check>
+
+## Step 3 — Start the stack
+
+```powershell
+docker compose --profile all up -d
+```
+
+<Warning>
+Use `--profile all`. The `db`, `redis`, and `serverless-redis-http` services are
+gated behind compose profiles — a plain `docker compose up -d` starts only the
+app and it won't be able to reach its database.
+</Warning>
+
+The first run pulls the prebuilt image (a few minutes). On boot the `web`
+container automatically runs `prisma migrate deploy`. Watch the logs until you
+see the server is ready:
+
+```powershell
+docker compose logs -f web
+```
+
+You're looking for:
+```
+✅ Database migrations completed successfully
+✅ Configuration complete. Starting server...
+▲ Next.js ...
+✓ Ready
+```
+
+Check all five containers are up (`db` should be `healthy`):
+```powershell
+docker compose ps
+```
+
+## Step 4 — Verify it works (the curl checks)
+
+```powershell
+# 1) Health endpoint → {"status":"ok"}   (first hit can be a slow cold start)
+(Invoke-WebRequest http://localhost:3000/api/health -UseBasicParsing -TimeoutSec 40).Content
+
+# 2) Landing page → HTTP 200
+(Invoke-WebRequest http://localhost:3000/ -UseBasicParsing).StatusCode
+
+# 3) Cron endpoint WITH the bearer token → HTTP 200 + JSON counts
+$cron = "<your CRON_SECRET>"
+Invoke-RestMethod "http://localhost:3000/api/cron/scheduled-actions" -Headers @{ Authorization = "Bearer $cron" }
+
+# 4) Same endpoint WITHOUT the token → should be rejected (401)
+try { Invoke-WebRequest "http://localhost:3000/api/cron/scheduled-actions" -UseBasicParsing }
+catch { "Rejected: HTTP $([int]$_.Exception.Response.StatusCode)" }
+
+# 5) Ollama reachable from INSIDE the web container
+docker compose exec web wget -qO- http://host.docker.internal:11434/api/tags
+
+# 6) Redis HTTP proxy accepts the token → {"result":"PONG"}
+$tok = "<your UPSTASH_REDIS_TOKEN>"
+Invoke-RestMethod "http://localhost:8079" -Method Post -Headers @{ Authorization = "Bearer $tok" } -Body '["PING"]' -ContentType "application/json"
+```
+
+Expected results:
+
+| Check | Expected |
+|---|---|
+| `/api/health` | `{"status":"ok"}` |
+| `/` (landing page) | HTTP `200` |
+| cron + bearer | HTTP `200`, e.g. `{"processed":0,...}` |
+| cron without bearer | HTTP `401` |
+| Ollama from container | JSON list including your model |
+| Redis `PING` | `{"result":"PONG"}` |
+
+Then open **http://localhost:3000** in your browser.
+
+## Troubleshooting
+
+| Symptom | Cause & fix |
+|---|---|
+| `web` container restarts in a loop | Env validation failed. Almost always blank `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`, or `DEFAULT_LLM_PROVIDER` not set. Fix `apps/web/.env`, then `docker compose --profile all up -d`. Inspect with `docker compose logs web`. |
+| `warning: "UPSTASH_REDIS_TOKEN" is not set` / Redis 401 | Missing or mismatched **root** `.env`. Ensure it exists and the token matches `apps/web/.env`, then recreate: `docker compose --profile all up -d serverless-redis-http`. |
+| App can't reach DB / Redis | You ran `up` without `--profile all`, so `db`/`redis` never started. |
+| Ollama calls fail | Ollama server not running, model name mismatch, or you used `localhost` instead of `host.docker.internal` in `OLLAMA_BASE_URL`. |
+| `/api/health` first call times out | Cold start — retry with a longer timeout (`-TimeoutSec 40`). |
+| Can boot but **can't sign in** | Expected with placeholder Google creds. Set up real Google OAuth (below). |
+
+Useful commands:
+```powershell
+docker compose logs -f web          # follow app logs
+docker compose ps                   # container status
+docker compose --profile all down   # stop everything (keeps the DB volume)
+docker compose --profile all down -v  # stop AND wipe the database volume
+docker compose --profile all pull web && docker compose --profile all up -d web  # update to latest image
+```
+
+## Connecting email accounts
+
+This is the important reality check for this project.
+
+<Warning>
+Inbox Zero supports **exactly two** email providers, both via **OAuth**:
+
+- **Google** — Gmail and Google Workspace
+- **Microsoft** — Outlook.com and Microsoft 365
+
+There is **no IMAP or SMTP** support anywhere in the codebase. As a result:
+
+- **Yahoo** → ❌ cannot be connected.
+- **Generic IMAP / on-prem Exchange / cPanel / Zimbra** → ❌ cannot be connected.
+
+If a mailbox is hosted on Google Workspace or Microsoft 365, it connects fine
+via the matching OAuth flow even if it's a custom domain.
+</Warning>
+
+**Multiple accounts are supported.** One user can connect several Gmail and/or
+Outlook accounts and switch between them — the data model is one user → many
+email accounts, each with its own OAuth tokens, via the built-in
+"add account" flow.
+
+To actually sign in and connect a Gmail account, replace the placeholder
+credentials with a real Google OAuth client:
+
+1. Follow [Google OAuth Setup](/hosting/google-oauth) — create an OAuth client,
+   add `http://localhost:3000` as an authorized origin and the app's Google
+   callback as a redirect URI, then put the real `GOOGLE_CLIENT_ID` /
+   `GOOGLE_CLIENT_SECRET` into `apps/web/.env`.
+2. For Gmail push notifications (real-time processing), optionally set up
+   [Google Pub/Sub](/hosting/google-pubsub). It's not required just to boot.
+3. For Outlook/Microsoft 365, follow [Microsoft OAuth Setup](/hosting/microsoft-oauth)
+   and set the `MICROSOFT_*` variables.
+4. Recreate the app container: `docker compose --profile all up -d web`.
+
+<Note>
+**Want Yahoo or a generic IMAP mailbox anyway?** That would require building a
+brand-new email provider — an IMAP/SMTP client, secure credential storage,
+folder sync, sending, and connection UI. It's a substantial feature, not a
+config toggle, and is out of scope for this setup.
+</Note>
