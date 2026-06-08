@@ -5,8 +5,10 @@ import {
 import { isLocalAuthBypassEnabled } from "@/utils/auth/local-bypass-config";
 import { isLocalBypassEmailAccount } from "@/utils/auth/local-bypass-email-account";
 import { GmailProvider } from "@/utils/email/google";
+import { ImapProvider } from "@/utils/email/imap";
 import { createLocalBypassEmailProvider } from "@/utils/email/local-bypass-provider";
 import { OutlookProvider } from "@/utils/email/microsoft";
+import { getImapConnectionForEmail } from "@/utils/imap/client";
 import type { EmailProvider } from "@/utils/email/types";
 import { assertProviderNotRateLimited } from "@/utils/email/rate-limit";
 import { toRateLimitProvider } from "@/utils/email/rate-limit-mode-error";
@@ -42,6 +44,11 @@ export async function createEmailProvider({
   if (rateLimitProvider === "google") {
     const client = await getGmailClientForEmail({ emailAccountId, logger });
     return new GmailProvider(client, logger, emailAccountId);
+  }
+
+  if (rateLimitProvider === "imap") {
+    const config = await getImapConnectionForEmail({ emailAccountId });
+    return new ImapProvider(config, logger, emailAccountId);
   }
 
   const client = await getOutlookClientForEmail({ emailAccountId, logger });

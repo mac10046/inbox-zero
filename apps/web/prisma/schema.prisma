@@ -27,6 +27,18 @@ model Account {
   scope                 String?
   id_token              String?       @db.Text
   session_state         String?
+
+  // IMAP/SMTP connection details. Only set when provider == "imap".
+  // imapPassword is encrypted with encryptToken() and reused for SMTP auth.
+  imapHost     String?
+  imapPort     Int?
+  imapSecure   Boolean?
+  imapUsername String?
+  imapPassword String?  @db.Text
+  smtpHost     String?
+  smtpPort     Int?
+  smtpSecure   Boolean?
+
   user                  User          @relation(fields: [userId], references: [id], onDelete: Cascade)
   emailAccount          EmailAccount?
 

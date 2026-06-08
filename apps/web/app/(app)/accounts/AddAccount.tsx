@@ -7,6 +7,7 @@ import Image from "next/image";
 import { MutedText } from "@/components/Typography";
 import { getAccountLinkingUrl } from "@/utils/account-linking";
 import { isGoogleProvider } from "@/utils/email/provider-types";
+import { ConnectImapDialog } from "@/app/(app)/accounts/ConnectImapDialog";
 
 export function AddAccount() {
   const [isLoadingGoogle, setIsLoadingGoogle] = useState(false);
@@ -66,6 +67,10 @@ export function AddAccount() {
           />
           <span className="ml-2">Add Microsoft</span>
         </Button>
+      </div>
+
+      <div className="w-full">
+        <ConnectImapDialog />
       </div>
 
       <MutedText>You will be billed for each account.</MutedText>
